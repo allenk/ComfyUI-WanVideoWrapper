@@ -34,49 +34,88 @@ To clear your Triton cache you can delete the contents of following (default) fo
 
 # InfiniteTalk / MultiTalk Stability Notes
 
-The MultiTalk + InfiniteTalk path can be much more thermally aggressive than a
-typical Wan/LTX style workload. On some Windows systems this may show up as:
+The `MultiTalk + infinitetalk` path can be much more thermally aggressive than
+a typical Wan / LTX style workload. The main failure mode may look like a
+driver timeout or a random unstable run, but in practice the root cause can be
+more physical than software-facing:
 
-- sudden fan ramps
-- high instantaneous board power
-- unstable runtimes or TDR-like behavior
-- a run that feels "dangerously close" to crashing even when memory use looks fine
+- short SM-heavy bursts can stay pinned unusually hard
+- power can jump faster than the cooling response catches up
+- local hotspot behavior may become worse than what common software telemetry suggests
+- a system may hit a thermal wall or power wall before VRAM use looks dangerous
 
-Important: this does **not** always look like a classic out-of-memory problem.
-In practice the workload can hit local compute saturation, thermal response
-limits, or power/boost behavior long before software telemetry makes the danger
-obvious.
+This means a system can appear "fine" in normal monitoring tools while still
+behaving as if it is right at the edge of a crash.
+
+## What was fixed here
+
+This repo includes three practical mitigations for this path:
+
+1. Safe default speaker-mask generation for 2-speaker MultiTalk when
+   `ref_target_masks` are missing.
+2. A defensive fallback when `x_ref_attn_map` is missing, preventing early
+   `NoneType` crashes in the MultiTalk attention path.
+3. Configurable step/window throttling for `infinitetalk` mode to create
+   deliberate "breathing points" between GPU work segments.
+
+Those fixes address both sides of the problem:
+
+- correctness: make the workflow actually run instead of crashing early
+- runtime stability: reduce the chance that the GPU is driven into a hostile
+  thermal / boost regime
+
+## Why this path is different
 
 Observed pattern during validation:
 
 ```text
-normal video workload:  power/heat rise gradually
-InfiniteTalk path:      short bursts stay pinned on SM-heavy work
-result:                 much sharper thermal and acoustic behavior
+Normal Wan / LTX style run:
+  power rises gradually
+  heat rises gradually
+  fan response has time to catch up
+
+InfiniteTalk / MultiTalk:
+  short windows can stay pinned on SM-heavy work
+  local heat can spike unusually fast
+  fan and power response can become much sharper
 ```
 
 Very simplified sketch:
 
 ```text
-Temperature / stress
+Stress / heat density
 ^
-|                    InfiniteTalk
-|                  /\    /\      /\_
-|                 /  \  /  \    /   \__
-|   WAN / LTX   _/    \/    \__/        \_
-|
+|                        InfiniteTalk
+|                    ___/\/\__/\/\___/\/\__
+|                 __/
+|   Wan / LTX   _/  \____    ____    ______
+|                         \__/    \__/
 +-------------------------------------------------> time
 ```
 
-### What was patched here
+Another way to think about it:
 
-This repo contains three practical mitigations for the problematic path:
+```text
+             easy to see in software?     easy to cool in time?
+normal load            yes                       usually yes
+InfiniTalk burst       not always                not always
+```
 
-1. Safe default speaker-mask generation for 2-speaker MultiTalk when masks are missing.
-2. A defensive fallback when `x_ref_attn_map` is missing, preventing early `NoneType` crashes.
-3. Configurable step/window throttling for `infinitetalk` mode to create breathing room between GPU work segments.
+## Why the throttle exists
 
-### Default throttle behavior
+This delay is not just cosmetic padding. The goal is to break up the most
+problematic path into smaller chunks so the GPU gets natural recovery points:
+
+- between denoise steps
+- between audio windows
+
+Important limitation: this cannot interrupt a single long CUDA kernel that is
+already in flight. If one fused kernel is itself too aggressive, no external
+sleep call can pause it halfway through. What the throttle *can* do is reduce
+continuous back-to-back pressure across steps and windows, which was enough to
+materially improve real-world stability in testing.
+
+## Default throttle behavior
 
 For `infinitetalk` mode the current defaults are:
 
@@ -97,50 +136,102 @@ $env:COMFYUI_MULTITALK_STEP_IDLE_SECONDS="0"
 $env:COMFYUI_MULTITALK_WINDOW_IDLE_SECONDS="0"
 ```
 
-### Why throttling exists
+## Practical validation summary
 
-This is not a cosmetic delay. The purpose is to reduce sustained stress in the
-most problematic path by introducing explicit breathing points:
+One validated `MultiTalk + infinitetalk` run used:
 
-- between denoise steps
-- between audio windows
+- `347` frames
+- `7` windows
+- `6` denoise steps per window
+- auto-generated 2-speaker masks
+- explicit `1.0s` step throttle
+- explicit `1.0s` window throttle
 
-This does **not** interrupt a single long CUDA kernel already in flight, but it
-can still materially improve overall thermal behavior and system stability.
+The measured behavior after patching was:
 
-### Practical validation summary
-
-During local validation of a MultiTalk InfiniteTalk workflow:
-
-- end-to-end runtime increased by roughly 1 minute
+- the workflow completed successfully instead of failing early
+- total runtime increased by about `1 minute`
 - GPU behavior became noticeably calmer
 - fan noise was less extreme
-- output completed successfully
-- the system no longer felt like it was on the edge of a crash during every run
+- thermal behavior looked more controlled
+- the workload no longer felt like it was "one bad transient away" from a crash
 
-Monitoring also showed that keeping the board around a controlled power range
-(for example around 400W on the tested system) was much safer than letting the
-workload chase aggressive transient boosts.
+A representative monitored range during the stabilized run looked roughly like:
 
-### Important warning
+- board power near the low `400W` range
+- GPU temperature mostly around the upper `70C` to low `80C` range
+- SM utilization still frequently near saturation
 
-Some systems may still encounter issues even with throttling enabled. The most
-likely reasons are:
+That last point matters: the throttle does **not** make the workload easy. It
+simply makes it less hostile.
 
-- thermal wall
-- power wall
-- local hotspot behavior
-- long SM-saturating kernels
+## Practical interpretation
 
-If a system is still unstable:
+The patched path should be viewed as:
+
+- more reliable
+- more repeatable
+- less acoustically violent
+- less likely to trip a sudden instability event
+
+It should **not** be viewed as proof that all GPUs can safely run this model at
+full unrestricted boost.
+
+## Thermal wall / power wall / hotspot notes
+
+For this workload, the limiting factor may be one of the following:
+
+- `thermal wall`
+  the card or silicon region is getting hot enough that boost behavior becomes
+  unstable or defensive
+- `power wall`
+  transient power demand is too aggressive, especially when boost tries to
+  chase short bursts
+- `local hotspot wall`
+  one region is much hotter than average, even if the reported global temp
+  still looks survivable
+- `long SM-saturating kernels`
+  certain kernels keep compute resources pinned with very little natural rest
+
+Simplified picture:
+
+```text
+                 +----------------------+
+requested work ->|  fused / heavy path  |-> sharp transient stress
+                 +----------------------+
+                              |
+                              v
+                    +-------------------+
+                    | boost / heat / VR |
+                    +-------------------+
+                              |
+                 +------------+------------+
+                 |                         |
+                 v                         v
+           survives cleanly         hits wall / TDR / hang
+```
+
+## If a system is still unstable
+
+If throttling alone is not enough, try the following:
 
 - reduce `frame_window_size`
 - reduce resolution
-- reduce step count
+- reduce denoise step count
 - cap board power
-- increase step/window idle time
+- increase `COMFYUI_MULTITALK_STEP_IDLE_SECONDS`
+- increase `COMFYUI_MULTITALK_WINDOW_IDLE_SECONDS`
+- avoid assuming that "normal VRAM usage" means "safe thermal behavior"
 
-Throttling is a safety/stability aid, not a universal guarantee.
+In practice, reducing workload density and limiting boost behavior can matter
+more than registry-based TDR tweaks.
+
+## Bottom line
+
+This patch is a stability aid, not a universal guarantee. It improves a real
+edge case, fixes a real correctness bug, and creates safer default behavior for
+an unusually aggressive path, but some systems may still need tighter power
+limits or smaller workloads to stay fully stable.
 
 # Why should I use custom nodes when WanVideo works natively?
 
