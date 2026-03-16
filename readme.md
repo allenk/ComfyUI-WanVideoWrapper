@@ -32,6 +32,116 @@ To clear your Triton cache you can delete the contents of following (default) fo
 
 # WORK IN PROGRESS (perpetually)
 
+# InfiniteTalk / MultiTalk Stability Notes
+
+The MultiTalk + InfiniteTalk path can be much more thermally aggressive than a
+typical Wan/LTX style workload. On some Windows systems this may show up as:
+
+- sudden fan ramps
+- high instantaneous board power
+- unstable runtimes or TDR-like behavior
+- a run that feels "dangerously close" to crashing even when memory use looks fine
+
+Important: this does **not** always look like a classic out-of-memory problem.
+In practice the workload can hit local compute saturation, thermal response
+limits, or power/boost behavior long before software telemetry makes the danger
+obvious.
+
+Observed pattern during validation:
+
+```text
+normal video workload:  power/heat rise gradually
+InfiniteTalk path:      short bursts stay pinned on SM-heavy work
+result:                 much sharper thermal and acoustic behavior
+```
+
+Very simplified sketch:
+
+```text
+Temperature / stress
+^
+|                    InfiniteTalk
+|                  /\    /\      /\_
+|                 /  \  /  \    /   \__
+|   WAN / LTX   _/    \/    \__/        \_
+|
++-------------------------------------------------> time
+```
+
+### What was patched here
+
+This repo contains three practical mitigations for the problematic path:
+
+1. Safe default speaker-mask generation for 2-speaker MultiTalk when masks are missing.
+2. A defensive fallback when `x_ref_attn_map` is missing, preventing early `NoneType` crashes.
+3. Configurable step/window throttling for `infinitetalk` mode to create breathing room between GPU work segments.
+
+### Default throttle behavior
+
+For `infinitetalk` mode the current defaults are:
+
+- `COMFYUI_MULTITALK_STEP_IDLE_SECONDS = 1.0`
+- `COMFYUI_MULTITALK_WINDOW_IDLE_SECONDS = 1.0`
+
+You can override them with environment variables:
+
+```powershell
+$env:COMFYUI_MULTITALK_STEP_IDLE_SECONDS="0.5"
+$env:COMFYUI_MULTITALK_WINDOW_IDLE_SECONDS="0.5"
+```
+
+Or disable them entirely:
+
+```powershell
+$env:COMFYUI_MULTITALK_STEP_IDLE_SECONDS="0"
+$env:COMFYUI_MULTITALK_WINDOW_IDLE_SECONDS="0"
+```
+
+### Why throttling exists
+
+This is not a cosmetic delay. The purpose is to reduce sustained stress in the
+most problematic path by introducing explicit breathing points:
+
+- between denoise steps
+- between audio windows
+
+This does **not** interrupt a single long CUDA kernel already in flight, but it
+can still materially improve overall thermal behavior and system stability.
+
+### Practical validation summary
+
+During local validation of a MultiTalk InfiniteTalk workflow:
+
+- end-to-end runtime increased by roughly 1 minute
+- GPU behavior became noticeably calmer
+- fan noise was less extreme
+- output completed successfully
+- the system no longer felt like it was on the edge of a crash during every run
+
+Monitoring also showed that keeping the board around a controlled power range
+(for example around 400W on the tested system) was much safer than letting the
+workload chase aggressive transient boosts.
+
+### Important warning
+
+Some systems may still encounter issues even with throttling enabled. The most
+likely reasons are:
+
+- thermal wall
+- power wall
+- local hotspot behavior
+- long SM-saturating kernels
+
+If a system is still unstable:
+
+- reduce `frame_window_size`
+- reduce resolution
+- reduce step count
+- cap board power
+- increase step/window idle time
+
+Throttling is a safety/stability aid, not a universal guarantee.
+
 # Why should I use custom nodes when WanVideo works natively?
 
 Short answer: Unless it's a model/feature not available yet on native, you shouldn't.
