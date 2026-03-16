@@ -1,6 +1,7 @@
 import torch
 import os
 import gc
+import time
 from PIL import Image
 import numpy as np
 from ..latent_preview import prepare_callback
@@ -21,6 +22,17 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
+
+
+def _throttle_gpu_if_needed(delay_seconds, label):
+    if delay_seconds <= 0:
+        return
+    try:
+        mm.synchronize()
+    except Exception:
+        pass
+    log.info(f"MultiTalk throttle: sleeping {delay_seconds:.3f}s after {label}")
+    time.sleep(delay_seconds)
 
 def multitalk_loop(self, **kwargs):
     # Unpack kwargs into local variables
@@ -60,6 +72,10 @@ def multitalk_loop(self, **kwargs):
     offloaded = False
     tiled_vae = image_embeds.get("tiled_vae", False)
     frame_num = clip_length = image_embeds.get("frame_window_size", 81)
+    default_window_idle = 1.0 if mode == "infinitetalk" else 0.0
+    default_step_idle = 1.0 if mode == "infinitetalk" else 0.0
+    throttle_window_seconds = float(os.getenv("COMFYUI_MULTITALK_WINDOW_IDLE_SECONDS", default_window_idle))
+    throttle_step_seconds = float(os.getenv("COMFYUI_MULTITALK_STEP_IDLE_SECONDS", default_step_idle))
 
     clip_embeds = image_embeds.get("clip_context", None)
     if clip_embeds is not None:
@@ -88,7 +104,6 @@ def multitalk_loop(self, **kwargs):
         background_mask = torch.where((human_mask1 + human_mask2) > 0, torch.tensor(0), torch.tensor(1))
         human_masks = [human_mask1, human_mask2, background_mask]
         ref_target_masks = torch.stack(human_masks, dim=0)
-        multitalk_embeds['ref_target_masks'] = ref_target_masks
 
     gen_video_list = []
     is_first_clip = True
@@ -458,6 +473,8 @@ def multitalk_loop(self, **kwargs):
                 if humo_image_cond is None or not is_first_clip:
                     latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
 
+            _throttle_gpu_if_needed(throttle_step_seconds, f"step {i + 1}/{len(timesteps) - 1}")
+
         del noise, latent_motion_frames
         if offload:
             offload_transformer(transformer, remove_lora=False)
@@ -470,6 +487,7 @@ def multitalk_loop(self, **kwargs):
         vae.to(offload_device)
 
         sampling_pbar.close()
+        _throttle_gpu_if_needed(throttle_window_seconds, f"window {iteration_count + 1}/{estimated_iterations}")
 
         # crop drop_frames from end if enabled
         if mode == "skyreelsv3" and drop_frames > 0 and not arrive_last_frame:

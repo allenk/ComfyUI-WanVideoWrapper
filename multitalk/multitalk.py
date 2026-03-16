@@ -319,6 +319,11 @@ class SingleStreamMultiAttention(SingleStreamAttention):
         if human_num is None or human_num <= 1:
             return super().forward(x, encoder_hidden_states, shape)
 
+        # If per-speaker routing masks were not propagated, keep running with
+        # standard cross-attention instead of crashing the whole workflow.
+        if x_ref_attn_map is None:
+            return super().forward(x, encoder_hidden_states, shape)
+
         N_t, N_h, N_w = shape
         
         x_extra = None

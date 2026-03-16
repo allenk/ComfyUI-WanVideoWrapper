@@ -584,6 +584,27 @@ class WanVideoSampler:
             audio_scale = multitalk_embeds.get("audio_scale", 1.0)
             audio_cfg_scale = multitalk_embeds.get("audio_cfg_scale", 1.0)
             ref_target_masks = multitalk_embeds.get("ref_target_masks", None)
+            if ref_target_masks is None and multitalk_audio_embeds is not None and len(multitalk_audio_embeds) == 2:
+                target_h = image_embeds.get("target_h", None)
+                target_w = image_embeds.get("target_w", None)
+                if target_h is not None and target_w is not None:
+                    face_scale = 0.1
+                    x_min = int(target_h * face_scale)
+                    x_max = int(target_h * (1 - face_scale))
+                    left_y_min = int((target_w // 2) * face_scale)
+                    left_y_max = int((target_w // 2) * (1 - face_scale))
+                    right_y_min = int((target_w // 2) * face_scale + (target_w // 2))
+                    right_y_max = int((target_w // 2) * (1 - face_scale) + (target_w // 2))
+
+                    human_mask1 = torch.zeros((target_h, target_w), dtype=dtype)
+                    human_mask2 = torch.zeros((target_h, target_w), dtype=dtype)
+                    human_mask1[x_min:x_max, left_y_min:left_y_max] = 1
+                    human_mask2[x_min:x_max, right_y_min:right_y_max] = 1
+                    background_mask = (human_mask1 + human_mask2 == 0).to(dtype)
+                    ref_target_masks = torch.stack([human_mask1, human_mask2, background_mask], dim=0)
+                    log.info(f"Generated default MultiTalk masks for two speakers at {target_w}x{target_h}")
+                else:
+                    log.warning("MultiTalk found two speakers but target_h/target_w are missing, so no default ref_target_masks could be generated")
             if not isinstance(audio_cfg_scale, list):
                 audio_cfg_scale = [audio_cfg_scale] * (steps + 1)
 
